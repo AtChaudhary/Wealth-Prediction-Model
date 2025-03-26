@@ -1,0 +1,999 @@
+---
+title: "Machine Learning Project"
+output: html_document
+date: "2025-03-20"
+---
+I want to emphasize all functions have been created by ChatGpt. I used it to help debug and also explain each line of code so someone can easily read through it!
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Data and packages
+
+```{r}
+# Disable scientific notation
+options(scipen = 999)
+
+# Set number of digits to display (3 decimal places)
+options(digits = 3)
+data <-read.table("C:/Users/ashvi/OneDrive/Desktop/ML Business Forecasting/data_tr.txt", head=T)[,-1]
+
+library("splines")
+library("tidyverse")
+library("glmnet")
+library("leaps")
+library("boot")
+library("MASS")
+library("SemiPar")
+library("ISLR")
+library("mgcv")
+```
+
+## Understanding Data Format
+
+Total Wealth can go negative, people can go in debt. 
+Income can be
+negative(garnished wages perhaps) 
+1st Quarter people home values are less then their mortgage. 
+Dataset only goes up to those who are 65. 
+Two earners and being elegible for IRA is only a small percentage of people
+
+```{r}
+dim(data)
+head(data)
+names(data)
+summary(data)
+```
+
+##Visualize data relationships 
+IRA-positive 
+e401-positive 
+nifa-positive
+inc-slightly positive 
+hmort-positive but also weirdly flat 
+hval-positive
+hequity-positive
+educ-positive but small magnitude
+male-positive 
+twoearn-1 earner seems to make slightly more education
+dummies-seems a lot more stronger, will examine relationship to create
+additional variable for those who did more education then college
+Age-slightly positive family size-non linear relationship, peaks around
+2 then diminishes married-significant variation compared to non married
+individuals
+
+```{r}
+# Define the directory to save plots
+save_dir <- "C:/Users/ashvi/Downloads/"
+
+# Loop to plot and save each relationship of data
+for (i in 2:18) {
+
+  
+  # Create the plot
+  plot(data[, i], data[, 1], 
+       xlab = names(data)[i], 
+       ylab = names(data)[1], 
+       main = paste("TW vs", names(data)[i]))
+}
+  
+```
+Here I will use 2 outlier removal methods. First will use  transformation to reduce extreme values in wealth and income. Then I will be using IQR and removing variables that fall outside the typical range(25%-75%).  Finally I will will be using z scores to standardize the data. Secound method will be dropping observations greater then 1,000,000 from total wealth. 
+```{r}
+#Visualize numeric data
+hist(data$tw)
+hist(data$inc)
+
+# Function to remove outliers using IQR method
+remove_outliers_iqr <- function(x) {
+  Q1 <- quantile(x, 0.25)
+  Q3 <- quantile(x, 0.75)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 -  16* IQR
+  upper_bound <- Q3 + 16* IQR
+  return(x >= lower_bound & x <= upper_bound)
+}
+
+# Apply outlier removal for `tw`, and `inc`
+outlier_mask <- sapply(data[, c( "tw", "inc")], function(x) remove_outliers_iqr(x))
+
+# Track the number of rows dropped due to outliers
+rows_before_outliers <- nrow(data)
+data_clean1 <- data[apply(outlier_mask, 1, all), ]
+rows_after_outliers <- nrow(data_clean1)
+dropped_rows_outliers <- rows_before_outliers - rows_after_outliers
+cat("Rows dropped due to outliers in `ira`, `tw`, and `inc`: ", dropped_rows_outliers, "\n")
+
+# Drop rows where `tw` is greater than 1,000,000 from `data`
+rows_before_tw_drop <- nrow(data)  # Count rows before filtering
+data_clean2 <- data[data$tw <= 1000000, ]  # Correct filtering
+rows_after_tw_drop <- nrow(data_clean2)  # Count rows after filtering
+dropped_rows_tw <- rows_before_tw_drop - rows_after_tw_drop  # Compute number of dropped rows
+
+# Print the number of dropped rows
+cat("Rows dropped due to `tw > 1,000,000`: ", dropped_rows_tw, "\n")
+
+hist(data_clean1$tw)
+hist(data_clean1$inc)
+
+```
+
+
+##Baseline Model
+hequity=hval-hmort
+education variables dummies, watch out for collinearity
+Here is the baseline model trained on the three datasets and tested on the base dataset. The least squares automatically dropped perfectly collinear variables(hequity and college dummy)
+
+```{r}
+# Define number of folds for K-Fold Cross-Validation
+k <- 10
+n <- nrow(data)
+
+# Set seed for reproducibility
+set.seed(7141)
+
+# Generate k-fold indices
+id <- sample(rep(1:k, length = n))
+
+# Initialize vectors to store MSPE results for each model
+MSPE_0 <- MSPE_1 <- MSPE_2 <- vector(length = k)
+
+# Perform 10-fold cross-validation
+for (f in 1:k) {
+  train <- (id != f)  # Training set indices
+  test <- (id == f)   # Test set indices
+
+  ## Train models on different datasets
+  model0 <- lm(tw ~ ., data = data[train,])         # Model trained on original  without log transformations
+  model1 <- lm(tw ~ ., data = data_clean1[train,])   # Model trained on cleaned data (log + IQR)
+  model2 <- lm(tw ~ ., data = data_clean2[train,])   # Model trained on wealth-capped data
+
+  ## Make predictions on the original test set (data[test,])
+  pr_0 <- predict(model0, newdata = data[test,])
+  pr_1 <- predict(model1, newdata = data[test,])
+  pr_2 <- predict(model2, newdata = data[test,])
+
+  ## Compute MSPE (Mean Squared Prediction Error) on `data`
+  MSPE_0[f] <- mean((pr_0 - data$tw[test])^2)
+  MSPE_1[f] <- mean((pr_1 - data$tw[test])^2)
+  MSPE_2[f] <- mean((pr_2 - data$tw[test])^2)
+}
+
+# Compute the average MSPE for each model
+mean_MSPE_0 <- mean(MSPE_0)
+mean_MSPE_1 <- mean(MSPE_1)
+mean_MSPE_2 <- mean(MSPE_2)
+
+# Print results
+cat("Baseline Model MSPE (Trained on Original Data):", mean_MSPE_0, "\n")
+cat("Model 1 MSPE (Trained on IQR Cleaned Data):", mean_MSPE_1, "\n")
+cat("Model 2 MSPE (Trained on Wealth Cap Removed Data):", mean_MSPE_2, "\n")
+
+```
+##Ridge/Lasso/Stepwise
+
+Stepwise Regression
+
+```{r}
+# Define the full and null model
+full <- lm(tw ~ ., data=data)
+null <- lm(tw ~ 1, data=data)
+
+# forward stepwise - AIC
+a <- stepAIC(null, scope=list(lower=null, upper=full), trace = F, direction='forward')
+
+# backward stepwise - AIC
+b <- stepAIC(full, scope=list(lower=null, upper=full), trace = F, direction='backward')
+
+# Look at the coefficients to know which variables were selected
+coef(a)
+coef(b)
+
+# Predict forward and backward
+pr.stepwise_backward <- predict(b, newdata=data)
+pr.stepwise_forward <- predict(a, newdata=data)
+```
+Ridge Regression
+
+```{r}
+#choosing sequence of lambda
+lambdas.rr <- exp(seq(-20, 20, length = 200))
+#seperating to training and testing sets
+y <- data$tw
+X <- as.matrix(data[,-1])
+
+#set seed
+set.seed(67134)
+
+#Run ridge regression
+ridge_cv <- cv.glmnet(x = X, y = y, lambda = lambdas.rr,alpha = 0)
+# value of lambda that gives minimum mean cross-validated error
+ridge_cv$lambda.min
+
+# Use lamda.min to get the final model:
+ridge <- glmnet(x = X, y = y, lambda = ridge_cv$lambda.min,alpha = 0)
+
+```
+Lasso Regression
+```{r}
+#choosing sequence of lambda
+lambdas.LASSO <- exp(seq(-20, 20, length = 200))
+set.seed(123)
+LASSO_cv <- cv.glmnet(x = X, y = y, lambda = lambdas.LASSO,alpha = 1)
+# value of lambda that gives minimum mean cross-validated error
+LASSO_cv$lambda.min
+#use best lamnda
+LASSO <- glmnet(x = X, y = y, lambda = LASSO_cv$lambda.min,alpha = 1)
+LASSO$beta
+plot(LASSO_cv)
+```
+
+
+K-Fold Cross Validation Lasso v Ridge v Stepwise
+
+```{r}
+# 10-fold cross-validation setup
+k <- 10
+n <- nrow(data)
+set.seed(67134)
+id <- sample(rep(1:k, length = n))
+
+# Initialize vectors to store MSPE for each method
+MSPE_stepwise_forward <- MSPE_stepwise_backward <- MSPE_ridge <- MSPE_lasso <- vector(length = k)
+
+# Perform cross-validation
+for (f in 1:k) {
+  train <- (id != f)  # Training set
+  test <- (id == f)   # Test set
+  
+  # Prepare training and test data
+  X_train <- as.matrix(data[train, -1])  # Excluding the target variable `tw`
+  y_train <- data$tw[train]
+  X_test <- as.matrix(data[test, -1])
+  y_test <- data$tw[test]
+  
+  # 1. Forward Stepwise
+  full_model <- lm(tw ~ ., data = data[train,])
+  null_model <- lm(tw ~ 1, data = data[train,])
+  forward_model <- stepAIC(null_model, scope = list(lower = null_model, upper = full_model), direction = "forward", trace = FALSE)
+  pr_forward <- predict(forward_model, newdata = data[test,])
+  MSPE_stepwise_forward[f] <- mean((pr_forward - y_test)^2)
+  
+  # 2. Backward Stepwise
+  backward_model <- stepAIC(full_model, scope = list(lower = null_model, upper = full_model), direction = "backward", trace = FALSE)
+  pr_backward <- predict(backward_model, newdata = data[test,])
+  MSPE_stepwise_backward[f] <- mean((pr_backward - y_test)^2)
+  
+  # 3. Ridge Regression
+  ridge_cv <- cv.glmnet(x = X_train, y = y_train, alpha = 0)  # Ridge regression
+  ridge_model <- glmnet(x = X_train, y = y_train, lambda = ridge_cv$lambda.min, alpha = 0)
+  pr_ridge <- predict(ridge_model, newx = X_test)
+  MSPE_ridge[f] <- mean((pr_ridge - y_test)^2)
+  
+  # 4. Lasso Regression
+  lasso_cv <- cv.glmnet(x = X_train, y = y_train, alpha = 1)  # Lasso regression
+  lasso_model <- glmnet(x = X_train, y = y_train, lambda = lasso_cv$lambda.min, alpha = 1)
+  pr_lasso <- predict(lasso_model, newx = X_test)
+  MSPE_lasso[f] <- mean((pr_lasso - y_test)^2)
+}
+
+# Calculate the average MSPE for each model
+avg_MSPE_stepwise_forward <- mean(MSPE_stepwise_forward)
+avg_MSPE_stepwise_backward <- mean(MSPE_stepwise_backward)
+avg_MSPE_ridge <- mean(MSPE_ridge)
+avg_MSPE_lasso <- mean(MSPE_lasso)
+
+# Print the results
+cat("Stepwise Forward MSPE:", avg_MSPE_stepwise_forward, "\n")
+cat("Stepwise Backward MSPE:", avg_MSPE_stepwise_backward, "\n")
+cat("Ridge Regression MSPE:", avg_MSPE_ridge, "\n")
+cat("Lasso Regression MSPE:", avg_MSPE_lasso, "\n")
+```
+Now I will repeat this by training on the new clean datasets and testing on the "original" training dataset
+
+```{r}
+## T Train models on data_clean1
+set.seed(67134)
+# Stepwise Forward Model
+full_model_clean1 <- lm(tw ~ ., data = data_clean1)
+null_model_clean1 <- lm(tw ~ 1, data = data_clean1)
+forward_model_clean1 <- stepAIC(null_model_clean1, scope = list(lower = null_model_clean1, upper = full_model_clean1), direction = "forward", trace = FALSE)
+
+# Stepwise Backward Model
+backward_model_clean1 <- stepAIC(full_model_clean1, scope = list(lower = null_model_clean1, upper = full_model_clean1), direction = "backward", trace = FALSE)
+
+# Ridge Regression
+X_clean1 <- as.matrix(data_clean1[,-1])
+y_clean1 <- data_clean1$tw
+ridge_cv_clean1 <- cv.glmnet(x = X_clean1, y = y_clean1, alpha = 0)
+ridge_model_clean1 <- glmnet(x = X_clean1, y = y_clean1, lambda = ridge_cv_clean1$lambda.min, alpha = 0)
+
+# Lasso Regression
+lasso_cv_clean1 <- cv.glmnet(x = X_clean1, y = y_clean1, alpha = 1)
+lasso_model_clean1 <- glmnet(x = X_clean1, y = y_clean1, lambda = lasso_cv_clean1$lambda.min, alpha = 1)
+
+# Test on the whole dataset data
+# Prepare the test data (original data, not cleaned)
+X_data <- as.matrix(data[,-1])  # Use the full dataset
+y_data <- data$tw
+
+# Predict using the forward stepwise model (trained on data_clean1)
+pr_forward_clean1 <- predict(forward_model_clean1, newdata = data)
+MSPE_stepwise_forward_clean1 <- mean((pr_forward_clean1 - y_data)^2)
+
+# Predict using the backward stepwise model (trained on data_clean1)
+pr_backward_clean1 <- predict(backward_model_clean1, newdata = data)
+MSPE_stepwise_backward_clean1 <- mean((pr_backward_clean1 - y_data)^2)
+
+# Predict using Ridge model (trained on data_clean1)
+pr_ridge_clean1 <- predict(ridge_model_clean1, newx = X_data)
+MSPE_ridge_clean1 <- mean((pr_ridge_clean1 - y_data)^2)
+
+# Predict using Lasso model (trained on data_clean1)
+pr_lasso_clean1 <- predict(lasso_model_clean1, newx = X_data)
+MSPE_lasso_clean1 <- mean((pr_lasso_clean1 - y_data)^2)
+
+# Print MSPE for the models trained on data_clean1 and tested on full data
+cat("Forward Stepwise MSPE (trained on data_clean1, tested on data):", MSPE_stepwise_forward_clean1, "\n")
+cat("Backward Stepwise MSPE (trained on data_clean1, tested on data):", MSPE_stepwise_backward_clean1, "\n")
+cat("Ridge Regression MSPE (trained on data_clean1, tested on data):", MSPE_ridge_clean1, "\n")
+cat("Lasso Regression MSPE (trained on data_clean1, tested on data):", MSPE_lasso_clean1, "\n")
+
+# Now, repeat the process for data_clean2
+# Train models on data_clean2 (similar to the process for data_clean1)
+# Stepwise Forward Model
+full_model_clean2 <- lm(tw ~ ., data = data_clean2)
+null_model_clean2 <- lm(tw ~ 1, data = data_clean2)
+forward_model_clean2 <- stepAIC(null_model_clean2, scope = list(lower = null_model_clean2, upper = full_model_clean2), direction = "forward", trace = FALSE)
+
+# Stepwise Backward Model
+backward_model_clean2 <- stepAIC(full_model_clean2, scope = list(lower = null_model_clean2, upper = full_model_clean2), direction = "backward", trace = FALSE)
+
+# Ridge Regression
+X_clean2 <- as.matrix(data_clean2[,-1])
+y_clean2 <- data_clean2$tw
+ridge_cv_clean2 <- cv.glmnet(x = X_clean2, y = y_clean2, alpha = 0)
+ridge_model_clean2 <- glmnet(x = X_clean2, y = y_clean2, lambda = ridge_cv_clean2$lambda.min, alpha = 0)
+
+# Lasso Regression
+lasso_cv_clean2 <- cv.glmnet(x = X_clean2, y = y_clean2, alpha = 1)
+lasso_model_clean2 <- glmnet(x = X_clean2, y = y_clean2, lambda = lasso_cv_clean2$lambda.min, alpha = 1)
+
+# Test on the whole dataset data
+# Predict using the forward stepwise model (trained on data_clean2)
+pr_forward_clean2 <- predict(forward_model_clean2, newdata = data)
+MSPE_stepwise_forward_clean2 <- mean((pr_forward_clean2 - y_data)^2)
+
+# Predict using the backward stepwise model (trained on data_clean2)
+pr_backward_clean2 <- predict(backward_model_clean2, newdata = data)
+MSPE_stepwise_backward_clean2 <- mean((pr_backward_clean2 - y_data)^2)
+
+# Predict using Ridge model (trained on data_clean2)
+pr_ridge_clean2 <- predict(ridge_model_clean2, newx = X_data)
+MSPE_ridge_clean2 <- mean((pr_ridge_clean2 - y_data)^2)
+
+# Predict using Lasso model (trained on data_clean2)
+pr_lasso_clean2 <- predict(lasso_model_clean2, newx = X_data)
+MSPE_lasso_clean2 <- mean((pr_lasso_clean2 - y_data)^2)
+
+# Print MSPE for the models trained on data_clean2 and tested on full data
+cat("\nForward Stepwise MSPE (trained on data_clean2, tested on data):", MSPE_stepwise_forward_clean2, "\n")
+cat("Backward Stepwise MSPE (trained on data_clean2, tested on data):", MSPE_stepwise_backward_clean2, "\n")
+cat("Ridge Regression MSPE (trained on data_clean2, tested on data):", MSPE_ridge_clean2, "\n")
+cat("Lasso Regression MSPE (trained on data_clean2, tested on data):", MSPE_lasso_clean2, "\n")
+```
+Creating every possible interaction term
+```{r}
+# Remove 'tw' from the dataset since it's the target variable
+data_no_tw <- data[, !colnames(data) %in% "tw"]
+
+# Get the original feature names
+original_features <- names(data_no_tw)
+
+# Generate all possible pairwise interaction terms
+interaction_terms <- combn(original_features, 2, FUN = function(x) paste(x[1], x[2], sep=":"), simplify = TRUE)
+
+# Create the formula for the linear model including both original features and interaction terms
+formula_terms <- paste("tw ~", paste(c(original_features, interaction_terms), collapse=" + "))
+
+# Print the formula
+print(formula_terms)
+```
+Using feature selection methods to chose the best combination of variables
+```{r}
+# Fit full model with interaction terms
+full_model <- lm(as.formula(formula_terms), data = data)
+
+# Null model (intercept only)
+null_model <- lm(tw ~ 1, data = data)
+
+# Perform stepwise selection using both forward and backward directions based on AIC
+stepwise_model <- stepAIC(null_model, scope = list(lower = null_model, upper = full_model), direction = "both", trace = FALSE)
+
+# View selected features from the stepwise model
+cat("Selected features in Stepwise Model:\n")
+summary(stepwise_model)
+```
+
+```{r}
+# Create the model matrix (predictors)
+X_interactions <- model.matrix(as.formula(formula_terms), data = data)[,-1]  # Remove the intercept column
+y <- data$tw  # Target variable
+
+# Perform Lasso regression with cross-validation to select the optimal lambda
+lasso_cv <- cv.glmnet(X_interactions, y, alpha = 1)  # alpha=1 for Lasso regression
+
+# Best lambda selected by cross-validation
+cat("Best lambda from Lasso CV:", lasso_cv$lambda.min, "\n")
+
+# Fit Lasso model using the best lambda
+lasso_model <- glmnet(X_interactions, y, lambda = lasso_cv$lambda.min, alpha = 1)
+
+# View the coefficients of the Lasso model
+cat("\nLasso Regression Coefficients:\n")
+coef(lasso_model)
+summary(lasso_model)
+```
+Select features from interaction dataset
+```{r}
+# Stepwise Model (already fitted, e.g., stepwise_model)
+stepwise_coefficients <- coef(stepwise_model)
+selected_features_stepwise <- names(stepwise_coefficients)[stepwise_coefficients != 0]
+selected_features_stepwise <- selected_features_stepwise[selected_features_stepwise != "(Intercept)"]
+
+cat("Selected features from Stepwise model:\n")
+print(selected_features_stepwise)
+
+# Lasso Model (assuming lasso_model is already fitted)
+lasso_coefficients <- coef(lasso_model)
+lasso_coefficients_matrix <- as.matrix(lasso_coefficients)
+selected_features_lasso <- rownames(lasso_coefficients_matrix)[lasso_coefficients_matrix != 0]
+selected_features_lasso <- selected_features_lasso[selected_features_lasso != "(Intercept)"]
+
+cat("Selected features from Lasso model:\n")
+print(selected_features_lasso)
+
+```
+
+Use cross validation to see which model feature selection was better with ridge regression
+```{r}
+# Function to calculate MSPE (Mean Squared Prediction Error)
+calculate_mspe <- function(model, X_test, y_test) {
+  predictions <- predict(model, newx = X_test)
+  return(mean((predictions - y_test)^2))
+}
+
+# Set the number of folds for cross-validation (10-fold)
+k <- 10
+n <- nrow(data_clean1)  
+set.seed(67134)
+id <- sample(rep(1:k, length = n))
+
+# Prepare Stepwise-selected features in `data_clean1`
+X_clean1_stepwise <- model.matrix(as.formula(paste("tw ~", paste(selected_features_stepwise, collapse = " + "))), data = data_clean1)[, -1]
+# Prepare Lasso-selected features in `data_clean1`
+X_clean1_lasso <- model.matrix(as.formula(paste("tw ~", paste(selected_features_lasso, collapse = " + "))), data = data_clean1)[, -1]
+y_clean1 <- data_clean1$tw
+
+# Prepare test set from `data`
+X_test_stepwise <- model.matrix(as.formula(paste("tw ~", paste(selected_features_stepwise, collapse = " + "))), data = data)[, -1]
+X_test_lasso <- model.matrix(as.formula(paste("tw ~", paste(selected_features_lasso, collapse = " + "))), data = data)[, -1]
+y_test <- data$tw
+
+# Initialize vectors to store MSPE for each fold
+MSPE_ridge_stepwise <- MSPE_ridge_lasso <- vector(length = k)
+
+# 10-Fold Cross-Validation for Ridge Regression
+for (f in 1:k) {
+  train <- (id != f)  # Training set
+  valid <- (id == f)  # Validation set (within data_clean1)
+
+  # Stepwise Ridge Model
+  X_train_stepwise <- X_clean1_stepwise[train, ]
+  X_valid_stepwise <- X_clean1_stepwise[valid, ]
+  y_train_stepwise <- y_clean1[train]
+  y_valid_stepwise <- y_clean1[valid]
+
+  ridge_cv_stepwise <- cv.glmnet(X_train_stepwise, y_train_stepwise, alpha = 0, lambda = exp(seq(-20, 20, length = 200)))
+  ridge_model_stepwise <- glmnet(X_train_stepwise, y_train_stepwise, lambda = ridge_cv_stepwise$lambda.min, alpha = 0)
+
+  # Predict on `data`
+  predictions_stepwise <- predict(ridge_model_stepwise, newx = X_test_stepwise)
+  MSPE_ridge_stepwise[f] <- mean((predictions_stepwise - y_test)^2)
+
+  # Lasso Ridge Model
+  X_train_lasso <- X_clean1_lasso[train, ]
+  X_valid_lasso <- X_clean1_lasso[valid, ]
+  y_train_lasso <- y_clean1[train]
+  y_valid_lasso <- y_clean1[valid]
+
+  ridge_cv_lasso <- cv.glmnet(X_train_lasso, y_train_lasso, alpha = 0, lambda = exp(seq(-20, 20, length = 200)))
+  ridge_model_lasso <- glmnet(X_train_lasso, y_train_lasso, lambda = ridge_cv_lasso$lambda.min, alpha = 0)
+
+  # Predict on `data`
+  predictions_lasso <- predict(ridge_model_lasso, newx = X_test_lasso)
+  MSPE_ridge_lasso[f] <- mean((predictions_lasso - y_test)^2)
+}
+
+# Calculate the average MSPE
+avg_MSPE_ridge_stepwise <- mean(MSPE_ridge_stepwise)
+avg_MSPE_ridge_lasso <- mean(MSPE_ridge_lasso)
+
+# Print results
+cat("\nAverage MSPE for Ridge models trained on data_clean1 (with 10-fold CV) and tested on data:\n")
+cat("Ridge with Stepwise features:", avg_MSPE_ridge_stepwise, "\n")
+cat("Ridge with Lasso features:", avg_MSPE_ridge_lasso, "\n")
+```
+
+This code chunk is to save this model to the prediction data set. Sorry for spoilers but stepwise features with ridge regression was my best model. YOu can move past this!
+
+```{r}
+# Step 1: Read the data for prediction
+data_te <- read.table("C:/Users/ashvi/OneDrive/Desktop/ML Business Forecasting/data_for_prediction.txt", header = TRUE, sep = "\t", dec = ".")
+
+# Remove the 'tw' column from the data (it’s not part of the features for prediction)
+data_te <- data_te[, setdiff(names(data_te), "tw")]
+
+# Step 2: Prepare the test set matrix using selected features (including interaction terms)
+# Use the same formula with interaction terms that was used during model training
+formula_stepwise <- as.formula(paste("~", paste(selected_features_stepwise, collapse = " + ")))
+
+# Create the model matrix for test data with interaction terms
+X_test_te <- model.matrix(formula_stepwise, data = data_te)[, -1]  # Exclude intercept column
+
+# Step 3: Check the number of features in X_test_te to match with the model's training data
+cat("Number of features in test data:", ncol(X_test_te), "\n")
+
+# Ensure the number of features matches the model's expectations (27 features in this case)
+if (ncol(X_test_te) == 27) {
+  # Step 4: Make predictions using the trained stepwise ridge model
+  my_predictions <- predict(ridge_model_stepwise, newx = X_test_te)
+  
+  # Step 5: Add the predictions to the dataset as a new column
+  data_te$predicted_tw <- my_predictions
+  
+  # Step 6: Save the updated data with predictions back to a new text file
+  write.table(data_te, 
+            "C:/Users/ashvi/OneDrive/Desktop/ML Business Forecasting/Ashvin_Predictions.txt", 
+            sep = "\t", 
+            row.names = FALSE, 
+            col.names = TRUE)
+  
+  # Optional: Check the first few rows to confirm the added predictions
+  head(data_te)
+
+}
+```
+
+This is doing it with lasso regression, doesn't hurt to check. Ridge still performed best with the features selected with Step wise.
+```{r}
+# Function to calculate MSPE (Mean Squared Prediction Error)
+calculate_mspe <- function(model, X_test, y_test) {
+  predictions <- predict(model, newx = X_test)
+  return(mean((predictions - y_test)^2))
+}
+
+# Set the number of folds for cross-validation (10-fold)
+k <- 10
+n <- nrow(data_clean1)  
+set.seed(67134)
+id <- sample(rep(1:k, length = n))
+
+# Prepare Stepwise-selected features in `data_clean1`
+X_clean1_stepwise <- model.matrix(as.formula(paste("tw ~", paste(selected_features_stepwise, collapse = " + "))), data = data_clean1)[, -1]
+# Prepare Lasso-selected features in `data_clean1`
+X_clean1_lasso <- model.matrix(as.formula(paste("tw ~", paste(selected_features_lasso, collapse = " + "))), data = data_clean1)[, -1]
+y_clean1 <- data_clean1$tw
+
+# Prepare test set from `data`
+X_test_stepwise <- model.matrix(as.formula(paste("tw ~", paste(selected_features_stepwise, collapse = " + "))), data = data)[, -1]
+X_test_lasso <- model.matrix(as.formula(paste("tw ~", paste(selected_features_lasso, collapse = " + "))), data = data)[, -1]
+y_test <- data$tw
+
+# Initialize vectors to store MSPE for each fold
+MSPE_ridge_stepwise <- MSPE_ridge_lasso <- vector(length = k)
+
+# 10-Fold Cross-Validation for Ridge Regression
+for (f in 1:k) {
+  train <- (id != f)  # Training set
+  valid <- (id == f)  # Validation set (within data_clean1)
+
+  # Stepwise Ridge Model
+  X_train_stepwise <- X_clean1_stepwise[train, ]
+  X_valid_stepwise <- X_clean1_stepwise[valid, ]
+  y_train_stepwise <- y_clean1[train]
+  y_valid_stepwise <- y_clean1[valid]
+
+  ridge_cv_stepwise <- cv.glmnet(X_train_stepwise, y_train_stepwise, alpha = 1, lambda = exp(seq(-20, 20, length = 200)))
+  ridge_model_stepwise <- glmnet(X_train_stepwise, y_train_stepwise, lambda = ridge_cv_stepwise$lambda.min, alpha = 1)
+
+  # Predict on `data`
+  predictions_stepwise <- predict(ridge_model_stepwise, newx = X_test_stepwise)
+  MSPE_ridge_stepwise[f] <- mean((predictions_stepwise - y_test)^2)
+
+  # Lasso Ridge Model
+  X_train_lasso <- X_clean1_lasso[train, ]
+  X_valid_lasso <- X_clean1_lasso[valid, ]
+  y_train_lasso <- y_clean1[train]
+  y_valid_lasso <- y_clean1[valid]
+
+  ridge_cv_lasso <- cv.glmnet(X_train_lasso, y_train_lasso, alpha = 1, lambda = exp(seq(-20, 20, length = 200)))
+  ridge_model_lasso <- glmnet(X_train_lasso, y_train_lasso, lambda = ridge_cv_lasso$lambda.min, alpha = 1)
+
+  # Predict on `data`
+  predictions_lasso <- predict(ridge_model_lasso, newx = X_test_lasso)
+  MSPE_ridge_lasso[f] <- mean((predictions_lasso - y_test)^2)
+}
+
+# Calculate the average MSPE
+avg_MSPE_ridge_stepwise <- mean(MSPE_ridge_stepwise)
+avg_MSPE_ridge_lasso <- mean(MSPE_ridge_lasso)
+
+# Print results
+cat("\nAverage MSPE for Ridge models trained on data_clean1 (with 10-fold CV) and tested on data:\n")
+cat("Ridge with Stepwise features:", avg_MSPE_ridge_stepwise, "\n")
+cat("Ridge with Lasso features:", avg_MSPE_ridge_lasso, "\n")
+```
+##Flexible Linear Models
+Now we will move onto flexible linear models. We will create a simple gam model to visualize the flexible relationship between continous variables
+```{r}
+# Fit the GAM model to generate the smooth terms
+gam_model <- gam(tw ~ s(fsize) + s(inc) + s(educ) + s(age) + ira + nifa + male + e401 + twoearn + hmort + marr + hequity, data = data_clean1)
+
+# Add the smooth terms (splines) to the dataset
+data_clean1$s_fsize <- predict(gam_model, newdata = data_clean1, type = "terms")[, "s(fsize)"]
+data_clean1$s_inc <- predict(gam_model, newdata = data_clean1, type = "terms")[, "s(inc)"]
+data_clean1$s_educ <- predict(gam_model, newdata = data_clean1, type = "terms")[, "s(educ)"]
+data_clean1$s_age <- predict(gam_model, newdata = data_clean1, type = "terms")[, "s(age)"]
+```
+We will put the transformed spline features into a dataset, and like before generate every possible 1:1 interaction term.
+
+
+```{r}
+
+# Get the original feature names (excluding 'tw')
+original_features <- c("fsize", "inc", "educ", "age", "ira", "nifa", "male", "e401", "twoearn", "hmort")
+
+# Generate all pairwise interaction terms between the original and smoothed features
+interaction_terms <- combn(c(original_features, "s_fsize", "s_inc", "s_educ", "s_age"), 2, 
+                           FUN = function(x) paste(x[1], x[2], sep=":"), simplify = TRUE)
+
+# Create the formula for the linear model including both original features and interaction terms
+formula_terms <- paste("tw ~", paste(c(original_features, "s_fsize", "s_inc", "s_educ", "s_age", interaction_terms), collapse=" + "))
+print(formula_terms)
+
+```
+
+Now we will run feature selection method, stepwise both way ways to select features
+```{r}
+# Create the formula for the linear model including both original features and interaction terms
+formula_terms <- paste("tw ~", paste(c(original_features, "s_fsize", "s_inc", "s_educ", "s_age", interaction_terms), collapse=" + "))
+print(formula_terms)
+
+#it full model with interaction terms on data_clean1
+full_model <- lm(as.formula(formula_terms), data = data_clean1)
+
+# Null model (intercept only)
+null_model <- lm(tw ~ 1, data = data_clean1)
+
+# Perform stepwise selection using both forward and backward directions based on AIC
+stepwise_model <- stepAIC(null_model, scope = list(lower = null_model, upper = full_model), direction = "both", trace = FALSE)
+
+# View selected features from the stepwise model
+cat("Selected features in Stepwise Model:\n")
+selected_features_stepwise <- coef(stepwise_model)[coef(stepwise_model) != 0]
+selected_features_stepwise <- names(selected_features_stepwise)[selected_features_stepwise != "(Intercept)"]
+print(selected_features_stepwise)
+```
+We will do it again with Lasso
+```{r}
+# Create the model matrix (predictors) for interaction terms
+X_interactions <- model.matrix(as.formula(formula_terms), data = data_clean1)[,-1]  # Remove intercept column
+y <- data_clean1$tw  # Target variable
+
+set.seed(1234)
+# Perform Lasso regression with cross-validation to select the optimal lambda
+lasso_cv <- cv.glmnet(X_interactions, y, alpha = 1)  # alpha=1 for Lasso regression
+cat("Best lambda from Lasso CV:", lasso_cv$lambda.min, "\n")
+
+# Fit Lasso model using the best lambda
+lasso_model <- glmnet(X_interactions, y, lambda = lasso_cv$lambda.min, alpha = 1)
+
+# View the coefficients of the Lasso model
+cat("\nLasso Regression Coefficients:\n")
+coef(lasso_model)
+```
+Cross validation of ridge regression using lasso selected features and stepwise
+```{r}
+set.seed(67134)  # Set the seed for reproducibility
+
+# Number of folds for 10-fold cross-validation
+k <- 10
+n <- nrow(data_clean1)  
+id <- sample(rep(1:k, length = n))  # 10-fold cross-validation IDs
+
+# For Lasso-selected features
+X_lasso <- model.matrix(as.formula(paste("tw ~", paste(selected_features_lasso, collapse = " + "))), data = data_clean1)[,-1]
+y_lasso <- data_clean1$tw  # Target variable for Lasso model
+
+# Stepwise model fitting (you've already done this with your code)
+selected_features_stepwise <- names(coef(stepwise_model)[coef(stepwise_model) != 0])
+selected_features_stepwise <- selected_features_stepwise[selected_features_stepwise != "(Intercept)"]  # Remove intercept
+
+# Step 2: Create the model matrix for Stepwise-selected features
+X_stepwise <- model.matrix(as.formula(paste("tw ~", paste(selected_features_stepwise, collapse = " + "))), data = data_clean1)[,-1]  # Remove intercept
+y_stepwise <- data_clean1$tw  # Target variable for Stepwise model
+
+## Step 3: Now, perform Ridge regression for Lasso and Stepwise-selected features using 10-fold cross-validation
+# Initialize vectors to store MSPE for both models
+MSPE_ridge_lasso <- MSPE_ridge_stepwise <- vector(length = k)
+
+# Cross-validation loop for Ridge Regression using 10-fold cross-validation
+for (f in 1:k) {
+  train <- (id != f)  # Training set
+  valid <- (id == f)  # Validation set
+
+  # Ridge model using Lasso-selected features
+  ridge_cv_lasso <- cv.glmnet(X_lasso[train, ], y_lasso[train], alpha = 0)  # alpha=0 for Ridge regression
+  ridge_model_lasso <- glmnet(X_lasso[train, ], y_lasso[train], lambda = ridge_cv_lasso$lambda.min, alpha = 0)
+  predictions_lasso <- predict(ridge_model_lasso, newx = X_lasso[valid, ])
+  MSPE_ridge_lasso[f] <- mean((predictions_lasso - y_lasso[valid])^2)
+
+  # Ridge model using Stepwise-selected features
+  ridge_cv_stepwise <- cv.glmnet(X_stepwise[train, ], y_stepwise[train], alpha = 0)  # alpha=0 for Ridge regression
+  ridge_model_stepwise <- glmnet(X_stepwise[train, ], y_stepwise[train], lambda = ridge_cv_stepwise$lambda.min, alpha = 0)
+  predictions_stepwise <- predict(ridge_model_stepwise, newx = X_stepwise[valid, ])
+  MSPE_ridge_stepwise[f] <- mean((predictions_stepwise - y_stepwise[valid])^2)
+}
+
+# Step 4: Calculate the average MSPE for both models
+avg_MSPE_ridge_lasso <- mean(MSPE_ridge_lasso)
+avg_MSPE_ridge_stepwise <- mean(MSPE_ridge_stepwise)
+
+cat("\nAverage MSPE for Ridge models trained on data_clean1 and tested on data:\n")
+cat("Ridge with Lasso-selected features:", avg_MSPE_ridge_lasso, "\n")
+cat("Ridge with Stepwise-selected features:", avg_MSPE_ridge_stepwise, "\n")
+
+```
+They performed much worse then the linear models. I will now try with polynomials and splines
+
+```{r}
+set.seed(123)  # For reproducibility
+
+# Define the number of folds for cross-validation
+k <- 10
+
+# Split the data into k-folds (cross-validation)
+n <- nrow(data_clean1)
+folds <- sample(1:k, size = n, replace = TRUE)
+
+# Set up a vector to store cross-validation errors for each polynomial degree
+cv_errors_inc <- numeric(5)
+
+# Perform cross-validation for polynomial degrees 1 to 5 (for inc)
+for (degree in 1:5) {
+  cv_error <- 0  # Initialize error for this degree
+  
+  for (fold in 1:k) {
+    # Split the data into training and testing sets based on the fold
+    train_data <- data_clean1[folds != fold, ]
+    test_data <- data_clean1[folds == fold, ]
+    
+    # Create the formula with polynomial terms for inc (using I() for manual polynomials)
+    formula <- as.formula(paste("tw ~", paste("I(inc^", 1:degree, ")", collapse = " + ")))
+    
+    # Fit the model using the polynomial terms
+    model <- lm(formula, data = train_data)
+    
+    # Make predictions on the test set
+    predictions <- predict(model, newdata = test_data)
+    
+    # Calculate the Mean Squared Error (MSE) for this fold
+    mse <- mean((test_data$tw - predictions)^2)
+    cv_error <- cv_error + mse
+  }
+  
+  # Average the cross-validation error over all folds for this degree
+  cv_errors_inc[degree] <- cv_error / k
+}
+
+# Print the cross-validation errors for each degree (for inc)
+cv_errors_inc
+
+# Choose the degree with the lowest cross-validation error for inc
+best_degree_inc <- which.min(cv_errors_inc)
+best_degree_inc
+
+
+
+
+
+
+
+```
+
+```{r}
+# Load required package
+library(splines)
+
+# Cross-validation to choose the optimal degree for splines
+set.seed(614)
+y <- data_clean1$tw  # Dependent variable
+n <- length(y)       # Number of observations
+k <- 10              # Number of folds for cross-validation
+id <- sample(rep(1:k, length = n))  # Cross-validation fold assignment
+
+# Maximum number of df for splines
+max_df <- 20
+mspe_age <- rep(NA, max_df)
+mspe_inc <- rep(NA, max_df)
+
+# Cross-validation for age
+for (deg in 1:max_df) {
+  mspe <- vector(length = k)
+  
+  for (f in 1:k) {
+    test <- (id == f)
+    train <- (id != f)
+    
+    # Cubic spline fit for age with df = deg
+    spline_age <- lm(tw ~ bs(age, df = deg), data=data_clean1[train,])
+    
+    # Make predictions
+    pred <- predict(spline_age, newdata = data_clean1[test,])
+    
+    # Calculate MSPE
+    mspe[f] <- mean((y[test] - pred)^2)
+  }
+  mspe_age[deg] <- mean(mspe)
+}
+
+# Cross-validation for income
+for (deg in 1:max_df) {
+  mspe <- vector(length = k)
+  
+  for (f in 1:k) {
+    test <- (id == f)
+    train <- (id != f)
+    
+    # Cubic spline fit for income with df = deg
+    spline_inc <- lm(tw ~ bs(inc, df = deg), data=data_clean1[train,])
+    
+    # Make predictions
+    pred <- predict(spline_inc, newdata = data_clean1[test,])
+    
+    # Calculate MSPE
+    mspe[f] <- mean((y[test] - pred)^2)
+  }
+  mspe_inc[deg] <- mean(mspe)
+}
+
+# Find the optimal degree (minimum MSPE)
+optimal_degree_age <- which.min(mspe_age)
+optimal_degree_inc <- which.min(mspe_inc)
+
+cat("Optimal degree for age:", optimal_degree_age, "\n")
+cat("Optimal degree for income:", optimal_degree_inc, "\n")
+
+# Fit final models with optimal degrees
+spline_age_final <- lm(tw ~ bs(age, df = optimal_degree_age), data=data_clean1)
+spline_inc_final <- lm(tw ~ bs(inc, df = optimal_degree_inc), data=data_clean1)
+
+# Plotting the results
+# For Age
+plot(data_clean1$age, data_clean1$tw, xlab="Age", ylab="TW", main="Optimal Spline Regression for Age", pch=19, cex=0.5, col="red")
+lines(sort(data_clean1$age), predict(spline_age_final)[order(data_clean1$age)], col="blue", lwd=2)
+
+# For Income
+plot(data_clean1$inc, data_clean1$tw, xlab="Income", ylab="TW", main="Optimal Spline Regression for Income", pch=19, cex=0.5, col="red")
+lines(sort(data_clean1$inc), predict(spline_inc_final)[order(data_clean1$inc)], col="blue", lwd=2)
+
+```
+
+
+```{r}
+# Create the polynomial and spline features for age and income
+data_clean1$poly_age <- data_clean1$age  # 1st degree polynomial for age
+data_clean1$spline_age <- predict(lm(tw ~ bs(age, df = 7), data = data_clean1), newdata = data_clean1)  # 7th degree spline for age
+
+# Create 2nd-degree polynomial for income and 4th-degree spline for income
+data_clean1$poly_inc <- predict(lm(tw ~ poly(inc, 2), data = data_clean1), newdata = data_clean1)  # 2nd degree polynomial for income
+data_clean1$spline_inc <- predict(lm(tw ~ bs(inc, df = 4), data = data_clean1), newdata = data_clean1)  # 4th degree spline for income
+
+# Prepare the data for Lasso: Select predictors and response variable
+X_clean1 <- data_clean1[, c("age", "inc", "poly_age", "spline_age", "poly_inc", "spline_inc")]
+y_clean1 <- data_clean1$tw
+
+# Scaling the predictors (important for Lasso)
+X_clean1_scaled <- scale(X_clean1)
+
+# Cross-validation setup
+set.seed(614)
+n <- length(y_clean1)       # Number of observations
+k <- 10                     # Number of folds for cross-validation
+id <- sample(rep(1:k, length = n))  # Cross-validation fold assignment
+
+# Initialize MSPE vector for each model
+mspe_spline_age <- rep(NA, k)
+mspe_spline_inc <- rep(NA, k)
+mspe_poly_age <- rep(NA, k)
+mspe_poly_inc <- rep(NA, k)
+
+# Perform 10-fold cross-validation for each model
+for (f in 1:k) {
+  test <- (id == f)
+  train <- (id != f)
+  
+  # Get training and test data for both sets
+  X_train <- X_clean1_scaled[train, ]
+  y_train <- y_clean1[train]
+  X_test <- X_clean1_scaled[test, ]
+  y_test <- y_clean1[test]
+  
+  # Model 1: Spline for Age (7 degrees)
+  spline_age_model <- lm(tw ~ bs(age, df = 7), data = data_clean1[train,])
+  pred_spline_age <- predict(spline_age_model, newdata = data_clean1[test,])
+  mspe_spline_age[f] <- mean((y_test - pred_spline_age)^2)
+  
+  # Model 2: Spline for Income (4 degrees)
+  spline_inc_model <- lm(tw ~ bs(inc, df = 4), data = data_clean1[train,])
+  pred_spline_inc <- predict(spline_inc_model, newdata = data_clean1[test,])
+  mspe_spline_inc[f] <- mean((y_test - pred_spline_inc)^2)
+  
+  # Model 3: Linear Age (No transformation, just the raw data)
+  poly_age_model <- lm(tw ~ age, data = data_clean1[train,])
+  pred_poly_age <- predict(poly_age_model, newdata = data_clean1[test,])
+  mspe_poly_age[f] <- mean((y_test - pred_poly_age)^2)
+  
+  # Model 4: Polynomial for Income (2nd degree)
+  poly_inc_model <- lm(tw ~ poly(inc, 2), data = data_clean1[train,])
+  pred_poly_inc <- predict(poly_inc_model, newdata = data_clean1[test,])
+  mspe_poly_inc[f] <- mean((y_test - pred_poly_inc)^2)
+}
+
+# Calculate the average MSPE for each model
+mean_mspe_spline_age <- mean(mspe_spline_age)
+mean_mspe_spline_inc <- mean(mspe_spline_inc)
+mean_mspe_poly_age <- mean(mspe_poly_age)
+mean_mspe_poly_inc <- mean(mspe_poly_inc)
+
+# Print the results
+cat("Mean MSPE for Spline Age (7th degree):", mean_mspe_spline_age, "\n")
+cat("Mean MSPE for Spline Income (4th degree):", mean_mspe_spline_inc, "\n")
+cat("Mean MSPE for Linear Age:", mean_mspe_poly_age, "\n")
+cat("Mean MSPE for Polynomial Income (2nd degree):", mean_mspe_poly_inc, "\n")
+
+```
+
+I ran lasso to select which features to run in my flexible linear model. None of the poly features were chosen. I would argue with the information from all the cross validations & average MSPE, that in the goal for prediction, none of the transformations I have done would improve the MSPE from my current best model. 
+```{r}
+# Step 1: Create the polynomial feature for income (2nd-degree polynomial)
+data_clean1$poly_inc <- predict(lm(tw ~ poly(inc, 4), data = data_clean1), newdata = data_clean1)  # 2nd-degree polynomial for income
+
+# Step 2: Prepare the feature matrix (include original features + polynomial feature)
+# Assuming 'inc' is in the dataset, and 'tw' is the target variable
+X_full <- as.matrix(cbind(1, data_clean1[, -which(names(data_clean1) == "tw")], data_clean1$poly_inc))  # Add intercept and poly_inc
+
+y <- data_clean1$tw  # Target variable
+
+# Step 3: Run Lasso regression on the full dataset (original features + polynomial income feature)
+lasso_cv <- cv.glmnet(X_full, y, alpha = 1, lambda = exp(seq(-20, 20, length = 200)))
+
+# Step 4: Get the coefficients from the Lasso model
+lasso_coefficients <- coef(lasso_cv, s = "lambda.min")
+
+# Step 5: Print the coefficients to see which features were selected
+print(lasso_coefficients)
+
+# Step 6: Extract the non-zero features (coefficients)
+selected_features <- which(lasso_coefficients != 0)[-1]  # Exclude the intercept
+print(selected_features)  # Check the selected features
+
+# Check the selected features to ensure there are valid indices
+if (length(selected_features) == 0) {
+  stop("No features were selected by Lasso.")
+} else {
+  cat("Selected Features: ", selected_features, "\n")
+}
+```
